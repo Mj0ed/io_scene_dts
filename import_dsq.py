@@ -124,6 +124,8 @@ def load(operator, context, filepath,
 
     for mattersIndex, ob in enumerate(nodesTranslation):
       curves = ob_location_curves(ob)
+      frames = []
+      values = []
 
       for frameIndex in range(seq.numKeyframes):
         vec = dsq.translations[seq.baseTranslation + mattersIndex * seq.numKeyframes + frameIndex]
@@ -133,14 +135,15 @@ def load(operator, context, filepath,
           ref_vec = Vector(evaluate_all(curves, reference_frame))
           vec = ref_vec + vec
 
-        for curve in curves:
-          curve.keyframe_points.add(1)
-          key = curve.keyframe_points[-1]
-          key.interpolation = "LINEAR"
-          key.co = (last_frame + frameIndex * step, vec[curve.array_index])
+        frames.append(last_frame + frameIndex * step)
+        values.append(vec)
+
+      insert_keyframes(curves, frames, values)
 
     for mattersIndex, ob in enumerate(nodesRotation):
       mode, curves = ob_rotation_curves(ob)
+      frames = []
+      values = []
 
       for frameIndex in range(seq.numKeyframes):
         rot = dsq.rotations[seq.baseRotation + mattersIndex * seq.numKeyframes + frameIndex]
@@ -154,14 +157,15 @@ def load(operator, context, filepath,
         elif mode != 'QUATERNION':
           rot = rot.to_euler(mode)
 
-        for curve in curves:
-          curve.keyframe_points.add(1)
-          key = curve.keyframe_points[-1]
-          key.interpolation = "LINEAR"
-          key.co = (last_frame + frameIndex * step, rot[curve.array_index])
+        frames.append(last_frame + frameIndex * step)
+        values.append(rot)
+
+      insert_keyframes(curves, frames, values)
 
     for mattersIndex, ob in enumerate(nodesScale):
       curves = ob_scale_curves(ob)
+      frames = []
+      values = []
 
       for frameIndex in range(seq.numKeyframes):
         index = seq.baseScale + mattersIndex * seq.numKeyframes + frameIndex
@@ -178,11 +182,10 @@ def load(operator, context, filepath,
           print("Warning: Invalid scale flags found in sequence")
           break
 
-        for curve in curves:
-          curve.keyframe_points.add(1)
-          key = curve.keyframe_points[-1]
-          key.interpolation = "LINEAR"
-          key.co = (last_frame + frameIndex * step, scale[curve.array_index])
+        frames.append(last_frame + frameIndex * step)
+        values.append(scale)
+
+      insert_keyframes(curves, frames, values)
 
     context.scene.timeline_markers.new(name + ":start", last_frame)
     context.scene.timeline_markers.new(name + ":end", last_frame + seq.numKeyframes)

@@ -7,7 +7,7 @@ from .DtsShape import DtsShape
 from .DtsTypes import *
 from .write_report import write_debug_report
 from .util import fail, resolve_texture, default_materials, evaluate_all, find_reference, \
-    array_from_fcurves, array_from_fcurves_rotation, fcurves_keyframe_in_range
+    array_from_fcurves, array_from_fcurves_rotation, fcurves_keyframe_in_range, action_fcurves_read
 from .shared_export import find_seqs
 
 import re
@@ -18,6 +18,12 @@ common_col_name = re.compile(r"^(LOS)?[cC]ol-?\d+$")
 def undup_name(n):
     return n.split("#", 1)[0]
 
+def get_true_name(ob):
+    if "name" in ob:
+        return ob["name"]
+    else:
+        return undup_name(ob.name)
+
 def linearrgb_to_srgb(c):
     if c < 0.0031308:
         if c < 0:
@@ -26,6 +32,14 @@ def linearrgb_to_srgb(c):
             return c * 12.92
     else:
         return 1.055 * (c ** (1.0 / 2.4)) - 0.055
+
+def is_instance_selected(object_instance):
+    # For instanced objects we check selection of their instancer(more accurately: check
+    # selection status of the original object corresponding to the instancer).
+    if object_instance.parent:
+        return object_instance.parent.original.select_get()
+    # For non-instanced objects we check selection state of the original object.
+    return object_instance.object.original.select_get()
 
 def get_vertex_bone(mesh, node):
     for bone_index, (node_index, _) in enumerate(mesh.bones):
@@ -71,29 +85,27 @@ def add_vertex_influences(ob, armature, node_lookup, mesh, vert, vertex_index):
             weight * weight_multiplier))
 
 def export_material(mat, shape):
-    # print("Exporting material", mat.name)
-
     material_index = len(shape.materials)
     flags = 0
 
-    if mat.use_shadeless:
-        flags |= Material.SelfIlluminating
-    if mat.use_transparency:
+    #if mat.use_shadeless:
+    #    flags |= Material.SelfIlluminating
+    if mat.torque_props.blend_mode != "OPAQUE":
         flags |= Material.Translucent
     if mat.torque_props.blend_mode == "ADDITIVE":
         flags |= Material.Additive
     elif mat.torque_props.blend_mode == "SUBTRACTIVE":
         flags |= Material.Subtractive
 
-    if mat.torque_props.s_wrap:
+    # TODO: Get this from the Image Sampler node
+    texture_extension = "REPEAT"
+
+    if texture_extension == "REPEAT":
         flags |= Material.SWrap
-    if mat.torque_props.t_wrap:
         flags |= Material.TWrap
+
     flags |= Material.NeverEnvMap
-    if mat.torque_props.no_mipmaps:
-        flags |= Material.NoMipMap
-    if mat.torque_props.mip_bzero:
-        flags |= Material.MipMapZeroBorder
+    flags |= Material.NoMipMap
 
     if mat.torque_props.use_ifl:
         flags |= Material.IFLMaterial
@@ -117,15 +129,12 @@ def export_material(mat, shape):
 def seq_float_eq(a, b):
     return all(abs(i - j) < 0.000001 for i, j in zip(a, b))
 
-def export_empty_node(lookup, shape, select_object, ob, parent=-1):
-    if select_object and not ob.select:
+def export_nodes_from_empty(lookup, shape, depsgraph, ob, use_selection, parent=-1):
+    if use_selection and not ob.original.select_get():
         lookup[ob] = False
         return
 
-    if "name" in ob:
-        name = ob["name"]
-    else:
-        name = undup_name(ob.name)
+    name = get_true_name(ob)
 
     node = Node(shape.name(name), parent)
 
@@ -136,42 +145,34 @@ def export_empty_node(lookup, shape, select_object, ob, parent=-1):
     shape.nodes.append(node)
     lookup[ob] = node
 
-    for child in ob.children:
-        if child.type == 'EMPTY':
-            export_empty_node(lookup, shape, select_object, child, node)
+    for original_child in ob.original.children:
+        if original_child.type == "EMPTY":
+            child = original_child.evaluated_get(depsgraph)
+            export_nodes_from_empty(
+                lookup=lookup,
+                shape=shape,
+                depsgraph=depsgraph,
+                ob=child,
+                use_selection=use_selection,
+                parent=node)
 
-def export_bones(lookup, shape, armature, bones, parent=-1):
-    for bone in bones:
-        node = Node(shape.name(bone.name), parent)
-        node.bone = bone
-        node.bl_ob = bone
-
-        mat = bone.matrix_local
-
-        if bone.parent:
-            mat = bone.parent.matrix_local.inverted() * mat
-
-        node.armature = armature
-        node.bl_ob = bone
-        node.matrix = mat
-
-        shape.nodes.append(node)
-        lookup[bone] = node
-        export_bones(lookup, shape, armature, bone.children, node)
-
-def save_nodes(scene, shape, select_object, dsq_compat):
+def export_nodes(depsgraph, shape, use_selection):
+    # Dict from evaluated empty object to DTS node, or False if deselected
     node_lookup = {}
 
-    # Try to create nodes from empties armature bones
-    for ob in scene.objects:
-        if ob.parent is not None:
+    for object_instance in depsgraph.object_instances:
+        if object_instance.is_instance:
+            # We currently do not support instanced skeletons
+            # Not sure if that makes any sense
             continue
-
-        if ob.type == 'EMPTY':
-            export_empty_node(node_lookup, shape, select_object, ob)
-        elif ob.type == 'ARMATURE' and (ob.select or not select_object):
-            top_bones = filter(lambda b: b.parent is None, ob.data.bones)
-            export_bones(node_lookup, shape, ob, top_bones)
+        ob = object_instance.object
+        if ob.type == "EMPTY" and ob.parent is None:
+            export_nodes_from_empty(
+                lookup=node_lookup,
+                shape=shape,
+                depsgraph=depsgraph,
+                ob=ob,
+                use_selection=use_selection)
 
     # NodeOrder backwards compatibility
     if "NodeOrder" in bpy.data.texts:
@@ -182,171 +183,168 @@ def save_nodes(scene, shape, select_object, dsq_compat):
         order_key = {}
 
     # Sort by node indices from the DTS
-    if dsq_compat:
-        shape.nodes.sort(key=lambda n:
-            order_key.get(shape.names[n.name], n.bl_ob.get("nodeIndex", sys.maxsize)))
+    shape.nodes.sort(key=lambda n:
+        order_key.get(shape.names[n.name], n.bl_ob.get("nodeIndex", sys.maxsize)))
 
     for index, node in enumerate(shape.nodes):
         if not isinstance(node.parent, int):
-            if not hasattr(node.parent, "index") and dsq_compat:
-                node_lookup = {"fail": "DSQ compatibility export failed due to new node structure."}
-                break
             node.parent = node.parent.index
 
         location, rotation, scale = node.matrix.decompose()
 
         if not seq_float_eq((1, 1, 1), scale):
-            print("Warning: '{}' uses scale, which cannot be exported to DTS nodes"
-                  .format(shape.names[node.name]))
+            print(f"Warning: Node {shape.names[node.name]} uses scale, which cannot be exported")
 
         node.index = index
-        node.matrix_world = Matrix.Translation(location) * rotation.to_matrix().to_4x4()
+        node.matrix_world = Matrix.Translation(location) @ rotation.to_matrix().to_4x4()
 
         if node.parent != -1:
             parent = shape.nodes[node.parent]
-            node.matrix_world = parent.matrix_world * node.matrix_world
+            node.matrix_world = parent.matrix_world @ node.matrix_world
 
         shape.default_translations.append(location)
         shape.default_rotations.append(rotation)
 
     return node_lookup
 
-def save_meshes(scene, shape, node_lookup, select_object):
+def lod_name_from_ob(ob, dts_name):
+    lod_name = None
+
+    for collection in ob.users_collection:
+        if collection.name.startswith("LOD "):
+            set_lod_name = collection.name[len("LOD "):]
+            if lod_name is not None:
+                print("Warning: Mesh {} is in multiple LOD collections ({} and {})"
+                    .format(ob.name, lod_name, set_lod_name))
+                break
+            lod_name = set_lod_name
+
+    if lod_name is None:
+        if common_col_name.match(dts_name):
+            return "collision-1"
+        else:
+            return "detail32"
+    else:
+        return lod_name
+
+# Returns (attach_node, transform_mat) for a mesh object
+# attach_node will be False if the mesh should be ignored
+def find_dts_attach_node_for_ob(ob, node_lookup):
+    transform_mat = ob.matrix_local
+
+    if not ob.parent:
+        print(f"Warning: Mesh {ob.name} has no parent, will use __auto_root__ parent")
+        return None, transform_mat
+
+    if ob.parent_type == "OBJECT":
+        if ob.parent not in node_lookup:
+            # TODO: It's theoretically possible to generate a skeleton for parented meshes.
+            print(f"Ignoring mesh {ob.name} - parented to {ob.parent.name} which is a {ob.parent.type}. You can only parent meshes to empties, not other meshes.")
+            return False, False
+
+        if node_lookup[ob.parent] is False: # not selected
+            print(f"Ignoring mesh {ob.name} - parent empty {ob.parent.name} is deselected")
+            return False, False
+
+        attach_node = node_lookup[ob.parent].index
+        return attach_node, transform_mat
+
+    print(f"Warning: Mesh {ob.name} is using an unsupported parenting type {ob.parent_type} (to {ob.parent.name})")
+    return None, transform_mat
+
+def save_meshes(depsgraph, shape, node_lookup, use_selection):
     scene_lods = {}
     scene_objects = {}
 
-    auto_root_index = None
     bounds_ob = None
 
-    for bobj in scene.objects:
-        if bobj.type != "MESH":
+    for object_instance in depsgraph.object_instances:
+        ob = object_instance.object
+
+        if ob.type not in {"MESH", "CURVE", "SURFACE", "FONT", "META"}:
+            # Don't bother with objects that won't have any geometry anyway
             continue
 
-        if select_object and not bobj.select:
+        if use_selection and not is_instance_selected(object_instance):
             continue
 
-        if bobj.name.lower() == "bounds":
-            if bounds_ob:
-                print("Warning: Multiple 'bounds' objects found - check capitalization")
-            bounds_ob = bobj
+        if ob.name.lower() == "bounds":
+            if bounds_ob is not None:
+                print("Warning: Multiple 'bounds' meshes found, some may be capitalized differently")
+            bounds_ob = ob
             continue
 
-        if "name" in bobj:
-            name = bobj["name"]
+        export_mesh_object(ob,
+            shape=shape,
+            scene_lods=scene_lods,
+            scene_objects=scene_objects,
+            node_lookup=node_lookup)
+
+    return scene_objects, bounds_ob
+
+def export_mesh_object(ob, shape, scene_lods, scene_objects, node_lookup):
+    name = get_true_name(ob)
+    lod_name = lod_name_from_ob(ob, name)
+
+    if lod_name == "__ignore__":
+        return
+
+    attach_node, transform_mat = find_dts_attach_node_for_ob(ob, node_lookup)
+
+    if attach_node == False:
+        print(f"Notice: Skipping mesh '{ob.name}' because its parent node is deselected")
+        return
+
+    if attach_node is None:
+        # If there is no appropriate parent for the object, we generate a dummy
+        # parent node for it to be parented to.
+        if shape.auto_root_index is None:
+            shape.auto_root_index = len(shape.nodes)
+
+            node = Node(shape.name("__auto_root__"))
+            node.bl_ob = None
+            node.armature = None
+            node.index = shape.auto_root_index
+            node.matrix = Matrix.Identity(4)
+            node.matrix_world = node.matrix
+
+            shape.nodes.append(node)
+            shape.default_rotations.append(Quaternion((1, 0, 0, 0)))
+            shape.default_translations.append(Vector())
+
+        attach_node = shape.auto_root_index
+
+    # Find and optionally create the detail level.
+    lod_name_index, lod_name = shape.name_resolve(lod_name)
+
+    if lod_name not in scene_lods:
+        match = re_lod_size.search(lod_name)
+
+        if match:
+            lod_size = int(match.group(1))
         else:
-            name = undup_name(bobj.name)
+            lod_size = 32
+            print(f"Warning: LOD {lod_name} does not end with a size, assuming size {lod_size}")
 
-        if bobj.users_group:
-            if len(bobj.users_group) > 1:
-                print("Warning: Mesh {} is in multiple groups".format(bobj.name))
+        scene_lods[lod_name] = DetailLevel(name=lod_name_index, subshape=0, objectDetail=-1, size=lod_size)
+        shape.detail_levels.append(scene_lods[lod_name])
 
-            lod_name = bobj.users_group[0].name
-        elif common_col_name.match(name):
-            lod_name = "collision-1"
-        else:
-            lod_name = "detail32"
+    if name not in scene_objects:
+        object = Object(shape.name(name), numMeshes=0, firstMesh=0, node=attach_node)
+        # Will be set later once the materials are exported, during mesh export
+        object.has_transparency = False
+        shape.objects.append(object)
+        shape.objectstates.append(ObjectState(1.0, 0, 0)) # ff56g: search for a37hm
+        scene_objects[name] = (object, {})
+    else:
+        object = scene_objects[name][0]
+        if object.node != attach_node:
+            print(f"Warning: Object {name} is parented to different nodes in different LODs - this is not supported, the first found will be used")
 
-        if lod_name == "__ignore__":
-            continue
-
-        transform_mat = bobj.matrix_local
-        armature_modifier = None
-
-        # Try to find an armature modifier on the object
-        for modifier in bobj.modifiers:
-            if modifier.type != 'ARMATURE':
-                continue
-
-            armature_modifier = modifier
-            break
-
-        if armature_modifier is not None:
-            # Should we do something with the parent here?
-            # Ignore it for now.
-            print('NYI: Armature modifier on mesh {}'.format(bobj.name))
-            attach_node = None
-        elif bobj.parent:
-            if bobj.parent_type == 'BONE':
-                armature = bobj.parent
-                bone = armature.data.bones[bobj.parent_bone]
-
-                if bone not in node_lookup:
-                    print('Ignoring mesh {} - parent bone {} not included'
-                          .format(bobj.name, bone.name))
-                    continue
-
-                node = node_lookup[bone]
-                attach_node = node.index
-
-                # Compensate for matrix_local pointing to tail, offset to head
-                # Does this need to use node.matrix somehow?
-                transform_mat = Matrix.Translation((0, bone.length, 0)) * transform_mat
-            elif bobj.parent_type == 'OBJECT':
-                if bobj.parent not in node_lookup:
-                    print("The mesh '{}' has a parent of type '{}' (named '{}'). You can only parent meshes to empties, not other meshes.".format(bobj.name, bobj.parent.type, bobj.parent.name))
-                    continue
-
-                if node_lookup[bobj.parent] is False: # not selected
-                    continue
-
-                attach_node = node_lookup[bobj.parent].index
-            else:
-                print('Warning: Mesh "{}" is using an unsupported parenting type "{}"'
-                      .format(bobj.name, bobj.parent_type))
-                attach_node = None
-        else:
-            print("Warning: Mesh '{}' has no parent".format(bobj.name))
-            attach_node = None
-
-        if attach_node is None:
-            if auto_root_index is None:
-                auto_root_index = len(shape.nodes)
-
-                node = Node(shape.name("__auto_root__"))
-                node.bl_ob = None
-                node.armature = None
-                node.index = auto_root_index
-                node.matrix = Matrix.Identity(4)
-                node.matrix_world = node.matrix
-
-                shape.nodes.append(node)
-                shape.default_rotations.append(Quaternion((1, 0, 0, 0)))
-                shape.default_translations.append(Vector())
-
-            attach_node = auto_root_index
-
-        lod_name_index, lod_name = shape.name_resolve(lod_name)
-
-        if lod_name not in scene_lods:
-            match = re_lod_size.search(lod_name)
-
-            if match:
-                lod_size = int(match.group(1))
-            else:
-                print("Warning: LOD '{}' does not end with a size, assuming size 32".format(lod_name))
-                lod_size = 32 # setting?
-
-            print("Creating LOD '{}' (size {})".format(lod_name, lod_size))
-            scene_lods[lod_name] = DetailLevel(name=lod_name_index, subshape=0, objectDetail=-1, size=lod_size)
-            shape.detail_levels.append(scene_lods[lod_name])
-
-        if name not in scene_objects:
-            object = Object(shape.name(name), numMeshes=0, firstMesh=0, node=attach_node)
-            object.has_transparency = False
-            shape.objects.append(object)
-            shape.objectstates.append(ObjectState(1.0, 0, 0)) # ff56g: search for a37hm
-            scene_objects[name] = (object, {})
-
-        for slot in bobj.material_slots:
-            if slot.material.use_transparency:
-                scene_objects[name][0].has_transparency = True
-
-        if lod_name in scene_objects[name][1]:
-            print("Warning: Multiple objects {} in LOD {}, ignoring...".format(name, lod_name))
-        else:
-            scene_objects[name][1][lod_name] = (bobj, transform_mat, armature_modifier)
-
-    return scene_lods, scene_objects, bounds_ob
+    if lod_name in scene_objects[name][1]:
+        print(f"Warning: Object {name} has multiple meshes in LOD {lod_name}, the first found will be used")
+    else:
+        scene_objects[name][1][lod_name] = (ob, transform_mat)
 
 def compute_bounds(shape, bounds_ob):
     print("Computing bounds")
@@ -402,29 +400,26 @@ def save(operator, context, filepath,
          select_marker=False,
          blank_material=True,
          generate_texture="disabled",
-         raw_colors = False,
-         dsq_compat = False,
          apply_modifiers=True,
          debug_report=False):
-    print("Exporting scene to DTS")
 
     scene = context.scene
-    active = context.active_object
-    shape = DtsShape()
-
-    blank_material_index = None
-
     reference_frame = find_reference(scene)
 
     if reference_frame is not None:
         print("Note: Seeking to reference frame at", reference_frame)
         scene.frame_set(reference_frame)
 
-    node_lookup = save_nodes(scene, shape, select_object, dsq_compat)
-    if "fail" in node_lookup:
-        return fail(operator, node_lookup["fail"])
-    scene_lods, scene_objects, bounds_ob = save_meshes(
-        scene, shape, node_lookup, select_object)
+    depsgraph = context.evaluated_depsgraph_get()
+
+    shape = DtsShape()
+
+    blank_material_index = None
+
+    node_lookup = export_nodes(depsgraph, shape, select_object)
+
+    scene_objects, bounds_ob = save_meshes(
+        depsgraph, shape, node_lookup, select_object)
 
     # If the shape is empty, add a detail level so it is valid
     if not shape.detail_levels:
@@ -463,40 +458,19 @@ def save(operator, context, filepath,
 
             if lod_name in lods:
                 print("Exporting mesh '{}' (LOD '{}')".format(shape.names[object.name], lod_name))
-                bobj, transform_mat, armature_modifier = lods[lod_name]
+                bobj, transform_mat = lods[lod_name]
 
-                if armature_modifier is None:
-                    mesh_type = Mesh.StandardType
+                mesh_type = Mesh.StandardType
+
+                if apply_modifiers:
+                    mesh = bobj.to_mesh()
                 else:
-                    mesh_type = Mesh.SkinType
-                    armature = armature_modifier.object
-
-                #########################
-                ### Welcome to complexity
-
-                # Disable the armature modifier so it does not deform the mesh
-                # when writing it to the DTS file
-                if armature_modifier is not None:
-                    was_show_render = armature_modifier.show_render
-                    was_show_viewport = armature_modifier.show_viewport
-
-                    armature_modifier.show_render = False
-                    armature_modifier.show_viewport = False
-
-                mesh = bobj.to_mesh(scene, apply_modifiers, "PREVIEW")
+                    mesh = bobj.original.to_mesh()
                 bm = bmesh.new()
                 bm.from_mesh(mesh)
                 bmesh.ops.triangulate(bm, faces=bm.faces)
                 bm.to_mesh(mesh)
                 bm.free()
-
-                # Restore the armature modifier
-                if armature_modifier is not None:
-                    armature_modifier.show_render = was_show_render
-                    armature_modifier.show_viewport = was_show_viewport
-
-                # This is the danger zone
-                # Data from down here may not stay around!
 
                 dmesh = Mesh(mesh_type)
                 shape.meshes.append(dmesh)
@@ -526,6 +500,9 @@ def save(operator, context, filepath,
                         if bmat not in material_table:
                             material_table[bmat] = export_material(bmat, shape)
 
+                        if shape.materials[material_table[bmat]].flags & Material.Translucent:
+                            object.has_transparency = True
+
                         flags |= material_table[bmat] & Primitive.MaterialMask
                     elif blank_material:
                         if blank_material_index is None:
@@ -549,6 +526,11 @@ def save(operator, context, filepath,
 
                         for vert_index, loop_index in zip(reversed(poly.vertices), reversed(poly.loop_indices)):
                             vertex_index = len(dmesh.verts)
+
+                            if vertex_index == 2 ** 15 - 1:
+                                print(f"Mesh {bobj.name} has too many vertices (> {vertex_index})")
+                                break
+
                             dmesh.indices.append(len(dmesh.indices))
 
                             vert = mesh.vertices[vert_index]
@@ -558,8 +540,8 @@ def save(operator, context, filepath,
                             else:
                                 normal = vert.normal
 
-                            dmesh.verts.append(transform_mat * vert.co)
-                            dmesh.normals.append((transform_mat.to_3x3() * normal).normalized())
+                            dmesh.verts.append(transform_mat @ vert.co)
+                            dmesh.normals.append((transform_mat.to_3x3() @ normal).normalized())
 
                             dmesh.enormals.append(0)
 
@@ -568,24 +550,22 @@ def save(operator, context, filepath,
                                 dmesh.tverts.append(Vector((uv.x, 1 - uv.y)))
                             else:
                                 dmesh.tverts.append(Vector((0, 0)))
+                        else:
+                            continue
+                        break
 
-                            if mesh_type == Mesh.SkinType:
-                                add_vertex_influences(bobj, armature,
-                                                      node_lookup, dmesh,
-                                                      vert, vertex_index)
-
+                    print(len(dmesh.verts))
                     numElements = len(dmesh.verts) - firstElement
+                    print(f"Debug: Primitive has firstElement={firstElement} numElements={numElements}")
                     dmesh.primitives.append(Primitive(firstElement, numElements, flags))
 
-                bpy.data.meshes.remove(mesh) # RIP!
+                # bobj.to_mesh_clear() or bobj.original.to_mesh_clear()?
+                print(f"Mesh {bobj.name} with {len(mesh.polygons)} polygons exported to mesh with {len(dmesh.primitives)} primitives, {len(dmesh.indices)} indices, {len(dmesh.verts)} verts")
 
-                # ??? ? ?? ???? ??? ?
                 dmesh.vertsPerFrame = len(dmesh.verts)
 
                 if len(dmesh.indices) >= 65536:
-                    return fail(operator, "The mesh '{}' has too many vertex indices ({} >= 65536)".format(bobj.name, len(dmesh.indices)))
-
-                ### Nobody leaves Hotel California
+                    return fail(operator, f"The mesh {bobj.name} has too many vertex indices ({len(dmesh.indices)} >= 65536)")
             else:
                 # print("Adding Null mesh for object {} in LOD {}".format(shape.names[object.name], lod_name))
                 shape.meshes.append(Mesh(Mesh.NullType))
@@ -680,13 +660,13 @@ def save(operator, context, filepath,
 
             data = ob.animation_data
 
-            if not data or not data.action or not len(data.action.fcurves):
+            fcurves = action_fcurves_read(data) if data else []
+
+            if not data or not data.action or not len(fcurves):
                 continue
 
             base_translation, base_rotation, _ = node.matrix.decompose()
             base_scale = Vector((1.0, 1.0, 1.0))
-
-            fcurves = data.action.fcurves
 
             curves_rotation = array_from_fcurves_rotation(fcurves, ob)
             curves_translation = array_from_fcurves(fcurves, "location", 3)
@@ -728,11 +708,11 @@ def save(operator, context, filepath,
     with open(filepath, "wb") as fd:
         shape.save(fd)
 
-    write_material_textures(generate_texture, filepath, shape, raw_colors)
+    write_material_textures(generate_texture, filepath, shape)
 
     return {"FINISHED"}
 
-def write_material_textures(mode, filepath, shape, raw_colors):
+def write_material_textures(mode, filepath, shape):
     if mode == 'disabled':
         return
 
@@ -750,15 +730,15 @@ def write_material_textures(mode, filepath, shape, raw_colors):
             continue
 
         bl_mat = material.bl_mat
-        color = bl_mat.diffuse_color
-        if not raw_colors:
-            color = color * bl_mat.diffuse_intensity
-            color.r = linearrgb_to_srgb(color.r)
-            color.g = linearrgb_to_srgb(color.g)
-            color.b = linearrgb_to_srgb(color.b)
+        # Blender 2.80 removed Material.diffuse_intensity and made diffuse_color
+        # a 4-component (RGBA) array, so use the base color components directly.
+        diffuse = bl_mat.diffuse_color
+        r = linearrgb_to_srgb(diffuse[0])
+        g = linearrgb_to_srgb(diffuse[1])
+        b = linearrgb_to_srgb(diffuse[2])
 
         image = bpy.data.images.new(material.name.lower() + "_generated", 16, 16)
-        image.pixels = (color.r, color.g, color.b, 1.0) * 256
+        image.pixels = (r, g, b, 1.0) * 256
         image.filepath_raw = os.path.join(os.path.dirname(filepath), material.name + ".png")
         image.file_format = "PNG"
         image.save()

@@ -6,7 +6,7 @@ from itertools import groupby
 from .DsqFile import DsqFile
 from .DtsTypes import *
 from .util import fail, evaluate_all, find_reference, array_from_fcurves, \
-    array_from_fcurves_rotation, fcurves_keyframe_in_range, find_reference
+    array_from_fcurves_rotation, fcurves_keyframe_in_range, find_reference, action_fcurves_read
 from .shared_export import find_seqs
 
 def save(operator, context, filepath,
@@ -65,14 +65,14 @@ def save(operator, context, filepath,
     for node in dsq.nodes:
         ob = node_ob[node]
         data = ob.animation_data
-        if data and data.action and len(data.action.fcurves):
+        if data and data.action and len(action_fcurves_read(data)):
             animated_nodes.append(ob)
 
     for bobj in scene.objects:
         if bobj.type != "MESH" or bobj.name.lower() == "bounds":
             continue
 
-        if bobj.users_group and bobj.users_group[0].name == "__ignore__":
+        if any(col.name == "__ignore__" for col in bobj.users_collection):
             continue
 
         if not bobj.parent:
@@ -153,7 +153,7 @@ def save(operator, context, filepath,
 
             base_translation, base_rotation, base_scale = node_transform[ob]
 
-            fcurves = ob.animation_data.action.fcurves
+            fcurves = action_fcurves_read(ob.animation_data)
 
             curves_rotation = array_from_fcurves_rotation(fcurves, ob)
             curves_translation = array_from_fcurves(fcurves, "location", 3)

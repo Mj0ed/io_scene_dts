@@ -1,12 +1,14 @@
 import bpy
 import os
 from bpy_extras.io_utils import unpack_list
+from bpy_extras import node_shader_utils
 
 from .DtsShape import DtsShape
 from .DtsTypes import *
 from .write_report import write_debug_report
 from .util import default_materials, resolve_texture, get_rgb_colors, fail, \
-    ob_location_curves, ob_scale_curves, ob_rotation_curves, ob_rotation_data, evaluate_all
+    ob_location_curves, ob_scale_curves, ob_rotation_curves, ob_rotation_data, evaluate_all, \
+    insert_keyframes
 
 import operator
 from itertools import zip_longest, count
@@ -19,6 +21,26 @@ def grouper(iterable, n, fillvalue=None):
     args = [iter(iterable)] * n
     return zip_longest(*args, fillvalue=fillvalue)
 
+# Blender 4.0 renamed the Principled BSDF "Emission" socket to "Emission Color".
+def principled_emission_input(node):
+    inputs = node.inputs
+    if "Emission Color" in inputs:
+        return inputs["Emission Color"]
+    return inputs["Emission"]
+
+# Blender 4.2 (EEVEE Next) removed Material.shadow_method and added
+# Material.surface_render_method. Material.blend_method still exists but only
+# accepts OPAQUE/CLIP/HASHED/BLEND. Set transparency in a version-tolerant way.
+def set_material_transparent(mat):
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "BLEND"
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = "BLENDED"
+    if hasattr(mat, "use_transparent_shadow"):
+        mat.use_transparent_shadow = False
+    elif hasattr(mat, "shadow_method"):
+        mat.shadow_method = "NONE"
+
 def dedup_name(group, name):
     if name not in group:
         return name
@@ -29,77 +51,167 @@ def dedup_name(group, name):
         if new_name not in group:
             return new_name
 
-def import_material(color_source, dmat, filepath):
+def file_base_name(filepath):
+    return os.path.basename(filepath).rsplit(".", 1)[0]
+
+def import_material(dmat, filepath):
     bmat = bpy.data.materials.new(dedup_name(bpy.data.materials, dmat.name))
-    bmat.diffuse_intensity = 1
+
+    wrap = node_shader_utils.PrincipledBSDFWrapper(bmat, is_readonly=False)
 
     texname = resolve_texture(filepath, dmat.name)
+    teximg = None
+
+    if dmat.flags & Material.SWrap and dmat.flags & Material.TWrap:
+        texture_extension = "REPEAT" # The default, as well
+    elif dmat.flags & Material.SWrap or dmat.flags & Material.TWrap:
+        texture_extension = "REPEAT" # Not trivially supported by Blender
+    else:
+        texture_extension = "EXTEND"
 
     if texname is not None:
         try:
             teximg = bpy.data.images.load(texname)
         except:
             print("Cannot load image", texname)
+            teximg = None
 
-        texslot = bmat.texture_slots.add()
-        texslot.use_map_alpha = True
-        tex = texslot.texture = bpy.data.textures.new(dmat.name, "IMAGE")
-        tex.image = teximg
+        wrap.base_color_texture.image = teximg
+        wrap.base_color_texture.texcoords = "UV"
+        wrap.base_color_texture.extension = texture_extension
 
         # Try to figure out a diffuse color for solid shading
         if teximg.size[0] <= 16 and teximg.size[1] <= 16:
-            if teximg.use_alpha:
-                pixels = grouper(teximg.pixels, 4)
-            else:
-                pixels = grouper(teximg.pixels, 3)
-
+            pixels = grouper(teximg.pixels, teximg.channels)
             color = pixels.__next__()
 
             for other in pixels:
                 if other != color:
                     break
             else:
-                bmat.diffuse_color = color[:3]
+                if teximg.channels == 3 or teximg.channels == 4:
+                    bmat.diffuse_color = (color[0], color[1], color[2], 1.0)
     elif dmat.name.lower() in default_materials:
-        bmat.diffuse_color = default_materials[dmat.name.lower()]
-    else: # give it a random color
-        bmat.diffuse_color = color_source.__next__()
+        wrap.base_color = default_materials[dmat.name.lower()]
+        pass
+
+    if dmat.flags & Material.Translucent:
+        if teximg is not None and teximg.channels == 4:
+            wrap.alpha_texture.image = teximg
+            wrap.alpha_texture.texcoords = "UV"
+
+    return bmat
+
+#class Material:
+#        SWrap            = 0x00000001 - check
+#        TWrap            = 0x00000002 - check
+#        Translucent      = 0x00000004 - check
+#        Additive         = 0x00000008 - check?
+#        Subtractive      = 0x00000010 - check?
+#        SelfIlluminating = 0x00000020 - check
+#        NeverEnvMap      = 0x00000040
+#        NoMipMap         = 0x00000080
+#        MipMapZeroBorder = 0x00000100
+#        IFLMaterial      = 0x08000000
+#        IFLFrame         = 0x10000000
+#        DetailMap        = 0x20000000
+#        BumpMap          = 0x40000000
+#        ReflectanceMap   = 0x80000000
+#        AuxiliaryMask    = 0xE0000000
+def import_material(dmat, filepath):
+    mat = bpy.data.materials.new(dedup_name(bpy.data.materials, dmat.name))
+    mat.use_nodes = True
+
+    node_tree = mat.node_tree
+    nodes = node_tree.nodes
+    links = node_tree.links
+
+    node_out = nodes["Material Output"]
+    node_principled = nodes["Principled BSDF"]
+
+    image = None
+    image_path = resolve_texture(filepath, dmat.name)
+
+    if image_path is not None:
+        try:
+            image = bpy.data.images.load(image_path)
+        except:
+            print("Failed to load image", image_path)
+
+    if dmat.flags & Material.SWrap and dmat.flags & Material.TWrap:
+        texture_extension = "REPEAT" # The default, as well
+    elif dmat.flags & Material.SWrap or dmat.flags & Material.TWrap:
+        print("Warning: DTS material '{}' uses single axis texture extension, which is not supported by Blender".format(dmat.name))
+        texture_extension = "REPEAT" # Not trivially supported by Blender
+    else:
+        texture_extension = "EXTEND"
+
+    node_texture = nodes.new("ShaderNodeTexImage")
+    node_texture.label = "Source Texture"
+    node_texture.image = image
+    node_texture.extension = texture_extension
+    node_texture.location = (-600, 300)
+    node_mix_texture = nodes.new("ShaderNodeMixRGB")
+    node_mix_texture.label = "Colorshift"
+    node_mix_texture.location = (-200, 300)
+    node_mix_texture.inputs["Color1"].default_value = (1, 1, 1, 1)
+    links.new(node_texture.outputs["Color"], node_mix_texture.inputs["Color2"])
+    links.new(node_texture.outputs["Alpha"], node_mix_texture.inputs["Fac"])
+    color_socket = node_mix_texture.outputs["Color"]
+
+    if dmat.flags & Material.Translucent:
+        if dmat.flags & Material.Additive:
+            mat.torque_props.blend_mode = "ADDITIVE"
+            node_rgb_to_bw = nodes.new("ShaderNodeRGBToBW")
+            links.new(node_texture.outputs["Color"], node_rgb_to_bw.inputs["Color"])
+            alpha_output = node_rgb_to_bw.outputs["Val"]
+        elif dmat.flags & Material.Subtractive:
+            mat.torque_props.blend_mode = "SUBTRACTIVE"
+            # TODO: Figure out how to do subtractive in Blender
+            node_rgb_to_bw = nodes.new("ShaderNodeRGBToBW")
+            node_math = nodes.new("ShaderNodeMath")
+            node_math.operation = "SUBTRACT"
+            node_math.inputs[0].default_value = 1.0
+            links.new(node_texture.outputs["Color"], node_rgb_to_bw.inputs["Color"])
+            links.new(node_rgb_to_bw.outputs["Val"], node_math.inputs[1])
+            alpha_output = node_math.outputs["Value"]
+        else:
+            mat.torque_props.blend_mode = "TRANSLUCENT"
+            alpha_output = node_texture.outputs["Alpha"]
+
+        set_material_transparent(mat)
+        links.new(alpha_output, node_principled.inputs["Alpha"])
+    else:
+        mat.torque_props.blend_mode = "OPAQUE"
 
     if dmat.flags & Material.SelfIlluminating:
-        bmat.use_shadeless = True
-    if dmat.flags & Material.Translucent:
-        bmat.use_transparency = True
-
-    if dmat.flags & Material.Additive:
-        bmat.torque_props.blend_mode = "ADDITIVE"
-    elif dmat.flags & Material.Subtractive:
-        bmat.torque_props.blend_mode = "SUBTRACTIVE"
+        links.new(color_socket, principled_emission_input(node_principled))
+        node_principled.inputs["Base Color"].default_value = (0, 0, 0, 1)
     else:
-        bmat.torque_props.blend_mode = "NONE"
+        links.new(color_socket, node_principled.inputs["Base Color"])
 
-    if dmat.flags & Material.SWrap:
-        bmat.torque_props.s_wrap = True
-    if dmat.flags & Material.TWrap:
-        bmat.torque_props.t_wraps = True
+    #####
     if dmat.flags & Material.IFLMaterial:
-        bmat.torque_props.use_ifl = True
+        mat.torque_props.use_ifl = True
 
     # TODO: MipMapZeroBorder, IFLFrame, DetailMap, BumpMap, ReflectanceMap
     # AuxilaryMask?
+    #####
 
-    return bmat
+    return mat
 
 class index_pass:
     def __getitem__(self, item):
         return item
 
 def create_bmesh(dmesh, materials, shape):
-    me = bpy.data.meshes.new("Mesh")
+    me = bpy.data.meshes.new("")
 
     faces = []
     material_indices = {}
 
     indices_pass = index_pass()
+    print(f"Imported mesh #primitives={len(dmesh.primitives)} #indices={len(dmesh.indices)} #verts={len(dmesh.verts)}")
 
     for prim in dmesh.primitives:
         if prim.type & Primitive.Indexed:
@@ -108,6 +220,7 @@ def create_bmesh(dmesh, materials, shape):
             indices = indices_pass
 
         dmat = None
+        print(f"Imported mesh primitive firstElement={prim.firstElement} numElements={prim.numElements}")
 
         if not (prim.type & Primitive.NoMaterial):
             dmat = shape.materials[prim.type & Primitive.MaterialMask]
@@ -143,12 +256,16 @@ def create_bmesh(dmesh, materials, shape):
     me.polygons.add(len(faces))
     me.loops.add(len(faces) * 3)
 
-    me.uv_textures.new()
-    uvs = me.uv_layers[0]
-
+    # Build the polygon/loop topology before creating any loop-domain layers.
+    # In Blender 4.x a UV map is a loop-domain attribute, and creating it while
+    # the loop topology is still half-initialized (loop_start/vertex_index unset)
+    # crashes Blender, so finalize the topology and update() first.
     for i, ((verts, dmat), poly) in enumerate(zip(faces, me.polygons)):
         poly.use_smooth = True # DTS geometry is always smooth shaded
-        poly.loop_total = 3
+        # MeshPolygon.loop_total is read-only in Blender 4.x: it is derived from
+        # the gap between consecutive loop_start values. Every DTS face is a
+        # triangle and we allocated len(faces) * 3 loops, so loop_start = i * 3
+        # implicitly gives each polygon a loop_total of 3.
         poly.loop_start = i * 3
 
         if dmat:
@@ -156,6 +273,14 @@ def create_bmesh(dmesh, materials, shape):
 
         for j, index in zip(poly.loop_indices, verts):
             me.loops[j].vertex_index = index
+
+    me.update()
+
+    # Now the topology is valid, create the UV map and fill it.
+    uvs = me.uv_layers.new()
+
+    for (verts, dmat), poly in zip(faces, me.polygons):
+        for j, index in zip(poly.loop_indices, verts):
             uv = dmesh.tverts[index]
             uvs.data[j].uv = (uv.x, 1 - uv.y)
 
@@ -163,9 +288,6 @@ def create_bmesh(dmesh, materials, shape):
     me.update()
 
     return me
-
-def file_base_name(filepath):
-    return os.path.basename(filepath).rsplit(".", 1)[0]
 
 def insert_reference(frame, shape_nodes):
     for node in shape_nodes:
@@ -193,11 +315,7 @@ def insert_reference(frame, shape_nodes):
             key.interpolation = "LINEAR"
             key.co = (frame, rot[curve.array_index])
 
-def load(operator, context, filepath,
-         reference_keyframe=True,
-         import_sequences=True,
-         use_armature=False,
-         debug_report=False):
+def read_shape(filepath, debug_report):
     shape = DtsShape()
 
     with open(filepath, "rb") as fd:
@@ -208,18 +326,54 @@ def load(operator, context, filepath,
         with open(filepath + ".pass.dts", "wb") as fd:
             shape.save(fd)
 
-    # Create a Blender material for each DTS material
+    return shape
+
+# Create a Blender material for each DTS material
+def import_materials_to_dict(filepath, shape):
     materials = {}
-    color_source = get_rgb_colors()
 
     for dmat in shape.materials:
-        materials[dmat] = import_material(color_source, dmat, filepath)
+        materials[dmat] = import_material(dmat, filepath)
 
-    # Now assign IFL material properties where needed
+    return materials
+
+def assign_ifl_material_names(shape, material_map):
     for ifl in shape.iflmaterials:
-        mat = materials[shape.materials[ifl.slot]]
+        mat = material_map[shape.materials[ifl.slot]]
         assert mat.torque_props.use_ifl == True
         mat.torque_props.ifl_name = shape.names[ifl.name]
+
+def create_bounds(bounds):
+    me = bpy.data.meshes.new("")
+    me.vertices.add(8)
+    me.vertices[0].co = (bounds.min.x, bounds.min.y, bounds.min.z)
+    me.vertices[1].co = (bounds.max.x, bounds.min.y, bounds.min.z)
+    me.vertices[2].co = (bounds.max.x, bounds.max.y, bounds.min.z)
+    me.vertices[3].co = (bounds.min.x, bounds.max.y, bounds.min.z)
+    me.vertices[4].co = (bounds.min.x, bounds.min.y, bounds.max.z)
+    me.vertices[5].co = (bounds.max.x, bounds.min.y, bounds.max.z)
+    me.vertices[6].co = (bounds.max.x, bounds.max.y, bounds.max.z)
+    me.vertices[7].co = (bounds.min.x, bounds.max.y, bounds.max.z)
+    me.validate()
+    me.update()
+    ob = bpy.data.objects.new("bounds", me)
+    ob.display_type = "BOUNDS"
+    ob.hide_render = True
+    return ob
+
+def load(operator, context, filepath,
+         reference_keyframe=True,
+         import_sequences=True,
+         use_armature=False,
+         debug_report=False):
+    shape = read_shape(filepath, debug_report)
+    materials = import_materials_to_dict(filepath, shape)
+    assign_ifl_material_names(shape, materials)
+
+    root_collection = bpy.data.collections.new(file_base_name(filepath))
+    context.scene.collection.children.link(root_collection)
+
+    node_collection = bpy.data.collections.new("Nodes")
 
     # First load all the nodes into armatures
     lod_by_mesh = {}
@@ -231,25 +385,24 @@ def load(operator, context, filepath,
     node_obs_val = {}
 
     if use_armature:
-        root_arm = bpy.data.armatures.new(file_base_name(filepath))
-        root_ob = bpy.data.objects.new(root_arm.name, root_arm)
-        root_ob.show_x_ray = True
+        root_arm = bpy.data.armatures.new("")
+        root_ob = bpy.data.objects.new(file_base_name(filepath), root_arm)
 
-        context.scene.objects.link(root_ob)
-        context.scene.objects.active = root_ob
+        root_collection.objects.link(root_ob)
 
         # Calculate armature-space matrix, head and tail for each node
         for i, node in enumerate(shape.nodes):
             node.mat = shape.default_rotations[i].to_matrix()
-            node.mat = Matrix.Translation(shape.default_translations[i]) * node.mat.to_4x4()
+            node.mat = Matrix.Translation(shape.default_translations[i]) @ node.mat.to_4x4()
             if node.parent != -1:
-                node.mat = shape.nodes[node.parent].mat * node.mat
+                node.mat = shape.nodes[node.parent].mat @ node.mat
             # node.head = node.mat.to_translation()
             # node.tail = node.head + Vector((0, 0, 0.25))
             # node.tail = node.mat.to_translation()
             # node.head = node.tail - Vector((0, 0, 0.25))
 
-        bpy.ops.object.mode_set(mode="EDIT")
+        context.view_layer.objects.active = root_ob
+        bpy.ops.object.mode_set(mode="EDIT", toggle=False)
 
         edit_bone_table = []
         bone_names = []
@@ -271,15 +424,13 @@ def load(operator, context, filepath,
             edit_bone_table.append(bone)
             bone_names.append(bone.name)
 
-        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.mode_set(mode="OBJECT", toggle=False)
     else:
         if reference_keyframe:
             reference_marker = context.scene.timeline_markers.get("reference")
             if reference_marker is None:
-                reference_frame = 0
-                context.scene.timeline_markers.new("reference", reference_frame)
-            else:
-                reference_frame = reference_marker.frame
+                reference_marker = context.scene.timeline_markers.new("reference", frame=0)
+            reference_frame = reference_marker.frame
         else:
             reference_frame = None
 
@@ -288,8 +439,8 @@ def load(operator, context, filepath,
             ob = bpy.data.objects.new(dedup_name(bpy.data.objects, shape.names[node.name]), None)
             node.bl_ob = ob
             ob["nodeIndex"] = i
-            ob.empty_draw_type = "SINGLE_ARROW"
-            ob.empty_draw_size = 0.5
+            ob.empty_display_type = "SINGLE_ARROW"
+            ob.empty_display_size = 0.5
 
             if node.parent != -1:
                 ob.parent = node_obs[node.parent]
@@ -300,12 +451,15 @@ def load(operator, context, filepath,
             if shape.names[node.name] == "__auto_root__" and ob.rotation_quaternion.magnitude == 0:
                 ob.rotation_quaternion = (1, 0, 0, 0)
 
-            context.scene.objects.link(ob)
+            node_collection.objects.link(ob)
             node_obs.append(ob)
             node_obs_val[node] = ob
 
         if reference_keyframe:
             insert_reference(reference_frame, shape.nodes)
+
+    if node_collection.objects:
+        root_collection.children.link(node_collection)
 
     # Try animation?
     if import_sequences:
@@ -341,6 +495,8 @@ def load(operator, context, filepath,
             for mattersIndex, node in enumerate(nodesTranslation):
                 ob = node_obs_val[node]
                 curves = ob_location_curves(ob)
+                frames = []
+                values = []
 
                 for frameIndex in range(seq.numKeyframes):
                     vec = shape.node_translations[seq.baseTranslation + mattersIndex * seq.numKeyframes + frameIndex]
@@ -350,17 +506,16 @@ def load(operator, context, filepath,
                         ref_vec = Vector(evaluate_all(curves, reference_frame))
                         vec = ref_vec + vec
 
-                    for curve in curves:
-                        curve.keyframe_points.add(1)
-                        key = curve.keyframe_points[-1]
-                        key.interpolation = "LINEAR"
-                        key.co = (
-                            globalToolIndex + frameIndex * step,
-                            vec[curve.array_index])
+                    frames.append(globalToolIndex + frameIndex * step)
+                    values.append(vec)
+
+                insert_keyframes(curves, frames, values)
 
             for mattersIndex, node in enumerate(nodesRotation):
                 ob = node_obs_val[node]
                 mode, curves = ob_rotation_curves(ob)
+                frames = []
+                values = []
 
                 for frameIndex in range(seq.numKeyframes):
                     rot = shape.node_rotations[seq.baseRotation + mattersIndex * seq.numKeyframes + frameIndex]
@@ -374,21 +529,19 @@ def load(operator, context, filepath,
                     elif mode != 'QUATERNION':
                         rot = rot.to_euler(mode)
 
-                    for curve in curves:
-                        curve.keyframe_points.add(1)
-                        key = curve.keyframe_points[-1]
-                        key.interpolation = "LINEAR"
-                        key.co = (
-                            globalToolIndex + frameIndex * step,
-                            rot[curve.array_index])
+                    frames.append(globalToolIndex + frameIndex * step)
+                    values.append(rot)
+
+                insert_keyframes(curves, frames, values)
 
             for mattersIndex, node in enumerate(nodesScale):
                 ob = node_obs_val[node]
                 curves = ob_scale_curves(ob)
+                frames = []
+                values = []
 
                 for frameIndex in range(seq.numKeyframes):
                     index = seq.baseScale + mattersIndex * seq.numKeyframes + frameIndex
-                    vec = shape.node_translations[seq.baseTranslation + mattersIndex * seq.numKeyframes + frameIndex]
 
                     if seq.flags & Sequence.UniformScale:
                         s = shape.node_uniform_scales[index]
@@ -402,19 +555,16 @@ def load(operator, context, filepath,
                         print("Warning: Invalid scale flags found in sequence")
                         break
 
-                    for curve in curves:
-                        curve.keyframe_points.add(1)
-                        key = curve.keyframe_points[-1]
-                        key.interpolation = "LINEAR"
-                        key.co = (
-                            globalToolIndex + frameIndex * step,
-                            vec[curve.array_index])
+                    frames.append(globalToolIndex + frameIndex * step)
+                    values.append(vec)
+
+                insert_keyframes(curves, frames, values)
 
             # Insert a reference frame immediately before the animation
             # insert_reference(globalToolIndex - 2, shape.nodes)
 
-            context.scene.timeline_markers.new(name + ":start", globalToolIndex)
-            context.scene.timeline_markers.new(name + ":end", globalToolIndex + seq.numKeyframes * step - 1)
+            context.scene.timeline_markers.new(name + ":start", frame=globalToolIndex)
+            context.scene.timeline_markers.new(name + ":end", frame=globalToolIndex + seq.numKeyframes * step - 1)
             globalToolIndex += seq.numKeyframes * step + 30
 
         if "Sequences" in bpy.data.texts:
@@ -445,7 +595,16 @@ def load(operator, context, filepath,
 
             bmesh = create_bmesh(mesh, materials, shape)
             bobj = bpy.data.objects.new(dedup_name(bpy.data.objects, shape.names[obj.name]), bmesh)
-            context.scene.objects.link(bobj)
+
+            lod_name = shape.names[lod_by_mesh[meshIndex].name]
+
+            lod_collection_name = "LOD " + lod_name
+            lod_collection = bpy.data.collections.get(lod_collection_name)
+            if lod_collection is None:
+                lod_collection = bpy.data.collections.new(lod_collection_name)
+                root_collection.children.link(lod_collection)
+
+            lod_collection.objects.link(bobj)
 
             add_vertex_groups(mesh, bobj, shape)
 
@@ -461,29 +620,7 @@ def load(operator, context, filepath,
             else:
                 bobj.parent = node_obs[obj.node]
 
-            lod_name = shape.names[lod_by_mesh[meshIndex].name]
-
-            if lod_name not in bpy.data.groups:
-                bpy.data.groups.new(lod_name)
-
-            bpy.data.groups[lod_name].objects.link(bobj)
-
-    # Import a bounds mesh
-    me = bpy.data.meshes.new("Mesh")
-    me.vertices.add(8)
-    me.vertices[0].co = (shape.bounds.min.x, shape.bounds.min.y, shape.bounds.min.z)
-    me.vertices[1].co = (shape.bounds.max.x, shape.bounds.min.y, shape.bounds.min.z)
-    me.vertices[2].co = (shape.bounds.max.x, shape.bounds.max.y, shape.bounds.min.z)
-    me.vertices[3].co = (shape.bounds.min.x, shape.bounds.max.y, shape.bounds.min.z)
-    me.vertices[4].co = (shape.bounds.min.x, shape.bounds.min.y, shape.bounds.max.z)
-    me.vertices[5].co = (shape.bounds.max.x, shape.bounds.min.y, shape.bounds.max.z)
-    me.vertices[6].co = (shape.bounds.max.x, shape.bounds.max.y, shape.bounds.max.z)
-    me.vertices[7].co = (shape.bounds.min.x, shape.bounds.max.y, shape.bounds.max.z)
-    me.validate()
-    me.update()
-    ob = bpy.data.objects.new("bounds", me)
-    ob.draw_type = "BOUNDS"
-    context.scene.objects.link(ob)
+    root_collection.objects.link(create_bounds(shape.bounds))
 
     return {"FINISHED"}
 
