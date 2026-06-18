@@ -7,7 +7,8 @@ from .DtsShape import DtsShape
 from .DtsTypes import *
 from .write_report import write_debug_report
 from .util import default_materials, resolve_texture, get_rgb_colors, fail, \
-    ob_location_curves, ob_scale_curves, ob_rotation_curves, ob_rotation_data, evaluate_all
+    ob_location_curves, ob_scale_curves, ob_rotation_curves, ob_rotation_data, evaluate_all, \
+    insert_keyframes
 
 import operator
 from itertools import zip_longest, count
@@ -19,6 +20,26 @@ def grouper(iterable, n, fillvalue=None):
     # grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx"
     args = [iter(iterable)] * n
     return zip_longest(*args, fillvalue=fillvalue)
+
+# Blender 4.0 renamed the Principled BSDF "Emission" socket to "Emission Color".
+def principled_emission_input(node):
+    inputs = node.inputs
+    if "Emission Color" in inputs:
+        return inputs["Emission Color"]
+    return inputs["Emission"]
+
+# Blender 4.2 (EEVEE Next) removed Material.shadow_method and added
+# Material.surface_render_method. Material.blend_method still exists but only
+# accepts OPAQUE/CLIP/HASHED/BLEND. Set transparency in a version-tolerant way.
+def set_material_transparent(mat):
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "BLEND"
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = "BLENDED"
+    if hasattr(mat, "use_transparent_shadow"):
+        mat.use_transparent_shadow = False
+    elif hasattr(mat, "shadow_method"):
+        mat.shadow_method = "NONE"
 
 def dedup_name(group, name):
     if name not in group:
@@ -141,13 +162,12 @@ def import_material(dmat, filepath):
     if dmat.flags & Material.Translucent:
         if dmat.flags & Material.Additive:
             mat.torque_props.blend_mode = "ADDITIVE"
-            mat.blend_method = "ADDITIVE"
             node_rgb_to_bw = nodes.new("ShaderNodeRGBToBW")
             links.new(node_texture.outputs["Color"], node_rgb_to_bw.inputs["Color"])
             alpha_output = node_rgb_to_bw.outputs["Val"]
         elif dmat.flags & Material.Subtractive:
             mat.torque_props.blend_mode = "SUBTRACTIVE"
-            mat.blend_method = "ADDITIVE" # TODO: Figure out how to do subtractive in Blender
+            # TODO: Figure out how to do subtractive in Blender
             node_rgb_to_bw = nodes.new("ShaderNodeRGBToBW")
             node_math = nodes.new("ShaderNodeMath")
             node_math.operation = "SUBTRACT"
@@ -157,16 +177,15 @@ def import_material(dmat, filepath):
             alpha_output = node_math.outputs["Value"]
         else:
             mat.torque_props.blend_mode = "TRANSLUCENT"
-            mat.blend_method = "BLEND"
             alpha_output = node_texture.outputs["Alpha"]
 
-        mat.shadow_method = "NONE"
+        set_material_transparent(mat)
         links.new(alpha_output, node_principled.inputs["Alpha"])
     else:
         mat.torque_props.blend_mode = "OPAQUE"
 
     if dmat.flags & Material.SelfIlluminating:
-        links.new(color_socket, node_principled.inputs["Emission"])
+        links.new(color_socket, principled_emission_input(node_principled))
         node_principled.inputs["Base Color"].default_value = (0, 0, 0, 1)
     else:
         links.new(color_socket, node_principled.inputs["Base Color"])
@@ -237,11 +256,16 @@ def create_bmesh(dmesh, materials, shape):
     me.polygons.add(len(faces))
     me.loops.add(len(faces) * 3)
 
-    uvs = me.uv_layers.new()
-
+    # Build the polygon/loop topology before creating any loop-domain layers.
+    # In Blender 4.x a UV map is a loop-domain attribute, and creating it while
+    # the loop topology is still half-initialized (loop_start/vertex_index unset)
+    # crashes Blender, so finalize the topology and update() first.
     for i, ((verts, dmat), poly) in enumerate(zip(faces, me.polygons)):
         poly.use_smooth = True # DTS geometry is always smooth shaded
-        poly.loop_total = 3
+        # MeshPolygon.loop_total is read-only in Blender 4.x: it is derived from
+        # the gap between consecutive loop_start values. Every DTS face is a
+        # triangle and we allocated len(faces) * 3 loops, so loop_start = i * 3
+        # implicitly gives each polygon a loop_total of 3.
         poly.loop_start = i * 3
 
         if dmat:
@@ -249,6 +273,14 @@ def create_bmesh(dmesh, materials, shape):
 
         for j, index in zip(poly.loop_indices, verts):
             me.loops[j].vertex_index = index
+
+    me.update()
+
+    # Now the topology is valid, create the UV map and fill it.
+    uvs = me.uv_layers.new()
+
+    for (verts, dmat), poly in zip(faces, me.polygons):
+        for j, index in zip(poly.loop_indices, verts):
             uv = dmesh.tverts[index]
             uvs.data[j].uv = (uv.x, 1 - uv.y)
 
@@ -463,6 +495,8 @@ def load(operator, context, filepath,
             for mattersIndex, node in enumerate(nodesTranslation):
                 ob = node_obs_val[node]
                 curves = ob_location_curves(ob)
+                frames = []
+                values = []
 
                 for frameIndex in range(seq.numKeyframes):
                     vec = shape.node_translations[seq.baseTranslation + mattersIndex * seq.numKeyframes + frameIndex]
@@ -472,17 +506,16 @@ def load(operator, context, filepath,
                         ref_vec = Vector(evaluate_all(curves, reference_frame))
                         vec = ref_vec + vec
 
-                    for curve in curves:
-                        curve.keyframe_points.add(1)
-                        key = curve.keyframe_points[-1]
-                        key.interpolation = "LINEAR"
-                        key.co = (
-                            globalToolIndex + frameIndex * step,
-                            vec[curve.array_index])
+                    frames.append(globalToolIndex + frameIndex * step)
+                    values.append(vec)
+
+                insert_keyframes(curves, frames, values)
 
             for mattersIndex, node in enumerate(nodesRotation):
                 ob = node_obs_val[node]
                 mode, curves = ob_rotation_curves(ob)
+                frames = []
+                values = []
 
                 for frameIndex in range(seq.numKeyframes):
                     rot = shape.node_rotations[seq.baseRotation + mattersIndex * seq.numKeyframes + frameIndex]
@@ -496,21 +529,19 @@ def load(operator, context, filepath,
                     elif mode != 'QUATERNION':
                         rot = rot.to_euler(mode)
 
-                    for curve in curves:
-                        curve.keyframe_points.add(1)
-                        key = curve.keyframe_points[-1]
-                        key.interpolation = "LINEAR"
-                        key.co = (
-                            globalToolIndex + frameIndex * step,
-                            rot[curve.array_index])
+                    frames.append(globalToolIndex + frameIndex * step)
+                    values.append(rot)
+
+                insert_keyframes(curves, frames, values)
 
             for mattersIndex, node in enumerate(nodesScale):
                 ob = node_obs_val[node]
                 curves = ob_scale_curves(ob)
+                frames = []
+                values = []
 
                 for frameIndex in range(seq.numKeyframes):
                     index = seq.baseScale + mattersIndex * seq.numKeyframes + frameIndex
-                    vec = shape.node_translations[seq.baseTranslation + mattersIndex * seq.numKeyframes + frameIndex]
 
                     if seq.flags & Sequence.UniformScale:
                         s = shape.node_uniform_scales[index]
@@ -524,13 +555,10 @@ def load(operator, context, filepath,
                         print("Warning: Invalid scale flags found in sequence")
                         break
 
-                    for curve in curves:
-                        curve.keyframe_points.add(1)
-                        key = curve.keyframe_points[-1]
-                        key.interpolation = "LINEAR"
-                        key.co = (
-                            globalToolIndex + frameIndex * step,
-                            vec[curve.array_index])
+                    frames.append(globalToolIndex + frameIndex * step)
+                    values.append(vec)
+
+                insert_keyframes(curves, frames, values)
 
             # Insert a reference frame immediately before the animation
             # insert_reference(globalToolIndex - 2, shape.nodes)

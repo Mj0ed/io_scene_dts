@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Torque DTS format",
     "author": "port",
-    "version": (0, 3, 0),
-    "blender": (2, 80, 0),
+    "version": (0, 4, 0),
+    "blender": (4, 2, 0),
     "location": "File > Import-Export",
     "description": "Import-Export DTS meshes, UV's, materials and animations",
     "warning": "",
@@ -242,14 +242,13 @@ class SplitMeshIndex(bpy.types.Operator):
             out_me = bpy.data.meshes.new(ob.name)
             out_ob = bpy.data.objects.new(ob.name, out_me)
 
-            context.scene.objects.link(out_ob)
+            context.scene.collection.objects.link(out_ob)
 
             # For now, copy all verts over. See what happens?
             out_me.vertices.add(len(me.vertices))
 
             for vert, out_vert in zip(me.vertices, out_me.vertices):
                 out_vert.co = vert.co
-                out_vert.normal = vert.normal
 
         split()
 
@@ -267,14 +266,13 @@ class SplitMeshIndex(bpy.types.Operator):
             out_poly = out_me.polygons[-1]
 
             out_poly.loop_start = loop_start
-            out_poly.loop_total = poly.loop_total
+            # loop_total is read-only in Blender 4.x (derived from loop_start).
             out_poly.use_smooth = poly.use_smooth
 
             for loop_index, out_loop_index in zip(poly.loop_indices, out_poly.loop_indices):
                 loop = me.loops[loop_index]
                 out_loop = out_me.loops[out_loop_index]
 
-                out_loop.normal = loop.normal
                 out_loop.vertex_index = loop.vertex_index
 
         out_me.validate()

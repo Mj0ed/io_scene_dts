@@ -7,7 +7,7 @@ from .DtsShape import DtsShape
 from .DtsTypes import *
 from .write_report import write_debug_report
 from .util import fail, resolve_texture, default_materials, evaluate_all, find_reference, \
-    array_from_fcurves, array_from_fcurves_rotation, fcurves_keyframe_in_range
+    array_from_fcurves, array_from_fcurves_rotation, fcurves_keyframe_in_range, action_fcurves_read
 from .shared_export import find_seqs
 
 import re
@@ -147,7 +147,7 @@ def export_nodes_from_empty(lookup, shape, depsgraph, ob, use_selection, parent=
 
     for original_child in ob.original.children:
         if original_child.type == "EMPTY":
-            child = original_child.evaluated_get(depsgraph).object
+            child = original_child.evaluated_get(depsgraph)
             export_nodes_from_empty(
                 lookup=lookup,
                 shape=shape,
@@ -660,13 +660,13 @@ def save(operator, context, filepath,
 
             data = ob.animation_data
 
-            if not data or not data.action or not len(data.action.fcurves):
+            fcurves = action_fcurves_read(data) if data else []
+
+            if not data or not data.action or not len(fcurves):
                 continue
 
             base_translation, base_rotation, _ = node.matrix.decompose()
             base_scale = Vector((1.0, 1.0, 1.0))
-
-            fcurves = data.action.fcurves
 
             curves_rotation = array_from_fcurves_rotation(fcurves, ob)
             curves_translation = array_from_fcurves(fcurves, "location", 3)
@@ -730,13 +730,15 @@ def write_material_textures(mode, filepath, shape):
             continue
 
         bl_mat = material.bl_mat
-        color = bl_mat.diffuse_color * bl_mat.diffuse_intensity
-        color.r = linearrgb_to_srgb(color.r)
-        color.g = linearrgb_to_srgb(color.g)
-        color.b = linearrgb_to_srgb(color.b)
+        # Blender 2.80 removed Material.diffuse_intensity and made diffuse_color
+        # a 4-component (RGBA) array, so use the base color components directly.
+        diffuse = bl_mat.diffuse_color
+        r = linearrgb_to_srgb(diffuse[0])
+        g = linearrgb_to_srgb(diffuse[1])
+        b = linearrgb_to_srgb(diffuse[2])
 
         image = bpy.data.images.new(material.name.lower() + "_generated", 16, 16)
-        image.pixels = (color.r, color.g, color.b, 1.0) * 256
+        image.pixels = (r, g, b, 1.0) * 256
         image.filepath_raw = os.path.join(os.path.dirname(filepath), material.name + ".png")
         image.file_format = "PNG"
         image.save()

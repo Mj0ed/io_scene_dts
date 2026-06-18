@@ -79,11 +79,47 @@ def action_get_or_new(ob):
 
   return action
 
+# Blender 4.4 reworked Actions into "slotted actions": Action.fcurves was
+# removed and F-Curves now live in a channelbag bound to a slot. These helpers
+# return the relevant FCurve collection while staying compatible with the
+# legacy (Blender < 4.4) Action.fcurves API.
+def action_fcurves_ensure(ob, action):
+  if hasattr(action, "fcurves"):
+    return action.fcurves
+
+  anim_data = ob.animation_data
+  slot = anim_data.action_slot
+  if slot is None:
+    slot = action.slots.new(id_type='OBJECT', name=ob.name)
+    anim_data.action_slot = slot
+
+  layer = action.layers[0] if action.layers else action.layers.new("Layer")
+  strip = layer.strips[0] if layer.strips else layer.strips.new(type='KEYFRAME')
+  return strip.channelbag(slot, ensure=True).fcurves
+
+def action_fcurves_read(anim_data):
+  action = anim_data.action
+  if action is None:
+    return []
+  if hasattr(action, "fcurves"):
+    return action.fcurves
+
+  slot = anim_data.action_slot
+  if slot is None:
+    return []
+  for layer in action.layers:
+    for strip in layer.strips:
+      channelbag = strip.channelbag(slot)
+      if channelbag is not None:
+        return channelbag.fcurves
+  return []
+
 def ob_curves_array(ob, data_path, array_count):
   action = action_get_or_new(ob)
+  fcurves = action_fcurves_ensure(ob, action)
   curves = [None] * array_count
 
-  for curve in action.fcurves:
+  for curve in fcurves:
     if curve.data_path != data_path or curve.array_index < 0 or curve.array_index >= array_count:
       continue
 
@@ -94,9 +130,33 @@ def ob_curves_array(ob, data_path, array_count):
 
   for index, curve in enumerate(curves):
     if curve is None:
-      curves[index] = action.fcurves.new(data_path, index=index)
+      curves[index] = fcurves.new(data_path, index=index)
 
   return curves
+
+def insert_keyframes(curves, frames, values):
+  """Batch-insert LINEAR keyframes into each f-curve.
+
+  frames: sequence of frame numbers.
+  values: sequence aligned with frames; each item must be indexable by a
+          curve's array_index.
+
+  Adding all of a sequence's keyframe points in one ``add(n)`` call avoids the
+  O(n^2) reallocation that one-keyframe-at-a-time insertion causes on curves
+  that accumulate keyframes across many sequences. Frames are appended in
+  increasing order, so the curve stays sorted; with LINEAR interpolation the
+  handles are ignored, so no per-curve update()/recalculation is required.
+  """
+  for curve in curves:
+    points = curve.keyframe_points
+    base = len(points)
+    points.add(len(frames))
+    array_index = curve.array_index
+
+    for offset, frame in enumerate(frames):
+      point = points[base + offset]
+      point.interpolation = "LINEAR"
+      point.co = (frame, values[offset][array_index])
 
 def ob_location_curves(ob):
   return ob_curves_array(ob, "location", 3)

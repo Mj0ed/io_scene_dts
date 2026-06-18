@@ -447,7 +447,11 @@ def write_bit_set(fd, bits):
         fd.write(pack("<ii", numWords, numWords))
 
         for word in words:
-                fd.write(pack("<i", word))
+                # Pack as unsigned: a word with bit 31 set exceeds the signed
+                # int32 range and would raise struct.error (e.g. skeletons with
+                # 32+ nodes). The bytes are identical to the format's
+                # expectation and are read back correctly by read_bit_set.
+                fd.write(pack("<I", word & 0xFFFFFFFF))
 
 class Sequence:
         UniformScale = bit(0)
