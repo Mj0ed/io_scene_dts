@@ -576,11 +576,6 @@ def load(operator, context, filepath,
 
     # Then put objects in the armatures
     for obj in shape.objects:
-        if obj.node == -1:
-            print('Warning: Object {} is not attached to a node, ignoring'
-                  .format(shape.names[obj.name]))
-            continue
-
         for meshIndex in range(obj.numMeshes):
             mesh = shape.meshes[obj.firstMesh + meshIndex]
             mtype = mesh.type
@@ -590,7 +585,7 @@ def load(operator, context, filepath,
 
             if mtype != Mesh.StandardType and mtype != Mesh.SkinType:
                 print('Warning: Mesh #{} of object {} is of unsupported type {}, ignoring'.format(
-                    meshIndex + 1, mtype, shape.names[obj.name]))
+                    meshIndex + 1, shape.names[obj.name], mtype))
                 continue
 
             bmesh = create_bmesh(mesh, materials, shape)
@@ -608,16 +603,24 @@ def load(operator, context, filepath,
 
             add_vertex_groups(mesh, bobj, shape)
 
-            if use_armature:
-                bobj.parent = root_ob
-                bobj.parent_bone = bone_names[obj.node]
-                bobj.parent_type = "BONE"
-                bobj.matrix_world = shape.nodes[obj.node].mat
+            # Skin meshes - and any object not attached to a single node
+            # (node == -1) - are deformed across many bones via vertex groups
+            # rather than being parented to one node. Their vertices are stored
+            # in the shape's object space (the default/bind pose), so they can be
+            # left at the origin (or driven by the armature) and still display.
+            skinned = mtype == Mesh.SkinType or obj.node == -1
 
-                if mtype == Mesh.SkinType:
+            if use_armature:
+                if skinned:
+                    bobj.parent = root_ob
                     modifier = bobj.modifiers.new('Armature', 'ARMATURE')
                     modifier.object = root_ob
-            else:
+                else:
+                    bobj.parent = root_ob
+                    bobj.parent_bone = bone_names[obj.node]
+                    bobj.parent_type = "BONE"
+                    bobj.matrix_world = shape.nodes[obj.node].mat
+            elif obj.node != -1:
                 bobj.parent = node_obs[obj.node]
 
     root_collection.objects.link(create_bounds(shape.bounds))
@@ -627,7 +630,8 @@ def load(operator, context, filepath,
 def add_vertex_groups(mesh, ob, shape):
     for node, initial_transform in mesh.bones:
         # TODO: Handle initial_transform
-        ob.vertex_groups.new(shape.names[shape.nodes[node].name])
+        # vertex_groups.new() requires the name as a keyword argument in 4.x.
+        ob.vertex_groups.new(name=shape.names[shape.nodes[node].name])
 
     for vertex, bone, weight in mesh.influences:
         ob.vertex_groups[bone].add((vertex,), weight, 'REPLACE')

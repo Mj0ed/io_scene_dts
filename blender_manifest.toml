@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "io_scene_dts"
-version = "0.4.0"
+version = "0.4.1"
 name = "Torque DTS format"
 tagline = "Import and export Torque DTS/DSQ meshes and animations"
 maintainer = "port"
